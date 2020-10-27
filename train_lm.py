@@ -23,16 +23,18 @@ def parse_option():
     # optimization options
     parser.add_argument('--lr', type=float, default=1.0,
                         help='learning rate')
-    parser.add_argument('--batch_size', type=int, default=20,
-                        help='batch_size')
+    parser.add_argument('--batch-size', type=int, default=20,
+                        help='batch size')
     parser.add_argument('--epochs', type=int, default=25,
                         help='number of training epochs')
 
     # general experiment options
-    parser.add_argument('--checkpoint_path', default='output/', type=str,
+    parser.add_argument('--checkpoint-path', default='output/', type=str,
                         help='where to save checkpoints logs')
     parser.add_argument('--resume', default='', type=str,
                         help='path to latest checkpoint (default: none)')
+    parser.add_argument('--debug', action='store_true',
+                        help='whether in debug mode or not')
 
     args = parser.parse_args()
 
@@ -51,6 +53,7 @@ class CharCNN(nn.Module):
         feats = []
         for conv in self.conv:
             feats.append(self.tanh(conv(inp)))
+        # todo. max pool over time before concat
         return torch.cat(feats, dim=-1)
 
 
@@ -73,9 +76,9 @@ class HighwayLayer(nn.Module):
 
 
 class Highway(nn.Module):
-    def __init__(self, l, d):
+    def __init__(self, d, l):
         super(Highway, self).__init__()
-        self.layers = nn.ModuleList([Highway(d) for _ in range(l)])
+        self.layers = nn.ModuleList([HighwayLayer(d) for _ in range(l)])
 
     def forward(self, inp):
         for layer in self.layers:
@@ -91,28 +94,26 @@ class CharLSTM(nn.Module):
         self.char_d = 15
         self.lstm_l = 2
         if args.arch_large:
-            self.char_w = list(range(7))
+            self.char_w = [w+1 for w in range(7)]
             self.char_h = [min(200, w * 50) for w in self.char_w]
             self.highway_l = 2
             self.lstm_m = 650
         else:
-            self.char_w = list(range(6))
+            self.char_w = [w+1 for w in range(6)]
             self.char_h = [w * 25 for w in self.char_w]
             self.highway_l = 1
             self.lstm_m = 300
 
         # todo: add char-cnn model
-        self.char_cnn = CharCNN(d, self.char_w, self.char_h)
-
-        # todo: add highway network model
-        self.highway = Highway(d, self.highway_l)
+        self.char_cnn = CharCNN(self.char_d, self.char_w, self.char_h)
 
         inp_d = sum(self.char_h)
+        # todo: add highway network model
+        self.highway = Highway(inp_d, self.highway_l)
         self.lstm = nn.LSTM(inp_d, self.lstm_m, self.lstm_l)
 
 
 def main():
-
     args = parse_option()
     os.makedirs(args.checkpoint_path, exist_ok=True)
 
@@ -126,10 +127,10 @@ def main():
             logger.info(*args)
         builtins.print = print_pass
 
+    print(args)
+
     model = CharLSTM(args)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
-
-    print(args)
 
 
 if __name__ == '__main__':
