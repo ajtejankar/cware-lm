@@ -1,138 +1,199 @@
-import os
-import sys
-import time
-import random
-import argparse
 import builtins
-
+import argparse
+import time
+import math
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
+import torch.onnx
 
+import dataset
+import model
 from tools import get_logger
 
+parser = argparse.ArgumentParser(description='Train character and word level LSTM language models')
+parser.add_argument('--data', type=str, default='./data/ptb',
+                    help='location of the data corpus')
+parser.add_argument('--lr', type=float, default=20,
+                    help='initial learning rate')
+parser.add_argument('--clip', type=float, default=0.25,
+                    help='gradient clipping')
+parser.add_argument('--epochs', type=int, default=25,
+                    help='upper epoch limit')
+parser.add_argument('--batch_size', type=int, default=20, metavar='N',
+                    help='batch size')
+parser.add_argument('--bptt', type=int, default=35,
+                    help='sequence length')
+parser.add_argument('--seed', type=int, default=1111,
+                    help='random seed')
+parser.add_argument('--cuda', action='store_true',
+                    help='use CUDA')
+parser.add_argument('--log-interval', type=int, default=200, metavar='N',
+                    help='report interval')
 
-def parse_option():
-    parser = argparse.ArgumentParser('Train Char-LM')
+parser.add_argument('--word', action='store_true',
+                    help='use word level model')
+parser.add_argument('--arch_large', action='store_true',
+                    help='use large architecture')
 
-    # arch options
-    parser.add_argument('--arch-large', action='store_true',
-                        help='use the large model architecture')
+parser.add_argument('--save', type=str, default='output/',
+                    help='where to save checkpoints logs')
+parser.add_argument('--debug', action='store_true',
+                    help='whether in debug mode or not')
 
-    # optimization options
-    parser.add_argument('--lr', type=float, default=1.0,
-                        help='learning rate')
-    parser.add_argument('--batch-size', type=int, default=20,
-                        help='batch size')
-    parser.add_argument('--epochs', type=int, default=25,
-                        help='number of training epochs')
+args = parser.parse_args()
 
-    # general experiment options
-    parser.add_argument('--checkpoint-path', default='output/', type=str,
-                        help='where to save checkpoints logs')
-    parser.add_argument('--resume', default='', type=str,
-                        help='path to latest checkpoint (default: none)')
-    parser.add_argument('--debug', action='store_true',
-                        help='whether in debug mode or not')
+os.makedirs(args.save, exist_ok=True)
+if not args.debug:
+    os.environ['PYTHONBREAKPOINT'] = '0'
+    logger = get_logger(
+        logpath=os.path.join(args.save, 'logs'),
+        filepath=os.path.abspath(__file__)
+    )
+    def print_pass(*args):
+        logger.info(*args)
+    builtins.print = print_pass
 
-    args = parser.parse_args()
+print(args)
 
-    return args
+torch.manual_seed(args.seed)
 
+###############################################################################
+# Load data
+###############################################################################
 
-class CharCNN(nn.Module):
-    def __init__(self, d, w, h):
-        super(CharCNN, self).__init__()
-        self.conv = nn.ModuleList([
-            nn.Conv1d(d, h_i, w_i) for w_i, h_i in zip(w, h)
-        ])
-        self.tanh = nn.Tanh()
+corpus = dataset.Corpus(args.data, args.batch_size, args.bptt)
+train_data = corpus.all_tensors['train']
+val_data = corpus.all_tensors['valid']
+test_data = corpus.all_tensors['test']
 
-    def forward(self, inp):
-        feats = []
-        for conv in self.conv:
-            feats.append(self.tanh(conv(inp)))
-        # todo. max pool over time before concat
-        return torch.cat(feats, dim=-1)
+###############################################################################
+# Build the model
+###############################################################################
 
+ntokens = len(corpus.word_dict)
+n_chars = len(corpus.char_dict)
 
-class HighwayLayer(nn.Module):
-    def __init__(self, d):
-        super(HighwayLayer, self).__init__()
-        self.linear_t = nn.Linear(d, d)
-        self.linear_h = nn.Linear(d, d)
-        self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU()
+if args.word:
+    model = model.WordLSTM(args, ntokens).cuda()
+    def get_batch(inp, i):
+        word_targets = inp['targets']
+        seq_len = min(args.bptt, len(word_targets) - 1 - i)
+        data = word_targets[i:i+seq_len]
+        target = word_targets[i+1:i+1+seq_len].view(-1)
+        return data, target
+else:
+    model = model.CharLSTM(args, n_chars, ntokens).cuda()
+    def get_batch(inp, i):
+        word_targets = inp['targets']
+        seq_len = min(args.bptt, len(word_targets) - 1 - i)
+        data = inp['characters'][i:i+seq_len]
+        target = word_targets[i+1:i+1+seq_len].view(-1)
+        return data, target
 
-        # todo. initialize bT to a negative value
+print(model)
 
-    def forward(self, inp):
-        # t = sigmoid(Wt * inp + bt)
-        t = self.sigmoid(self.linear_t(inp))
-        # t .O relu(Wh * inp + bh) + (1 - t) .O y
-        out = t * self.relu(self.linear_h(inp)) + (1 - t) * inp
-        return out
+criterion = nn.NLLLoss()
 
+###############################################################################
+# Training code
+###############################################################################
 
-class Highway(nn.Module):
-    def __init__(self, d, l):
-        super(Highway, self).__init__()
-        self.layers = nn.ModuleList([HighwayLayer(d) for _ in range(l)])
+def repackage_hidden(h):
+    if isinstance(h, torch.Tensor):
+        return h.detach()
+    else:
+        return tuple(repackage_hidden(v) for v in h)
 
-    def forward(self, inp):
-        for layer in self.layers:
-            inp = layer(inp)
-        return inp
-
-
-class CharLSTM(nn.Module):
-    def __init__(self, args):
-        super(CharLSTM, self).__init__()
-
-        # architecture configurations
-        self.char_d = 15
-        self.lstm_l = 2
-        if args.arch_large:
-            self.char_w = [w+1 for w in range(7)]
-            self.char_h = [min(200, w * 50) for w in self.char_w]
-            self.highway_l = 2
-            self.lstm_m = 650
-        else:
-            self.char_w = [w+1 for w in range(6)]
-            self.char_h = [w * 25 for w in self.char_w]
-            self.highway_l = 1
-            self.lstm_m = 300
-
-        # todo: add char-cnn model
-        self.char_cnn = CharCNN(self.char_d, self.char_w, self.char_h)
-
-        inp_d = sum(self.char_h)
-        # todo: add highway network model
-        self.highway = Highway(inp_d, self.highway_l)
-        self.lstm = nn.LSTM(inp_d, self.lstm_m, self.lstm_l)
-
-
-def main():
-    args = parse_option()
-    os.makedirs(args.checkpoint_path, exist_ok=True)
-
-    if not args.debug:
-        os.environ['PYTHONBREAKPOINT'] = '0'
-        logger = get_logger(
-            logpath=os.path.join(args.checkpoint_path, 'logs'),
-            filepath=os.path.abspath(__file__)
-        )
-        def print_pass(*args):
-            logger.info(*args)
-        builtins.print = print_pass
-
-    print(args)
-
-    model = CharLSTM(args)
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+def evaluate(data_source):
+    model.eval()
+    total_loss = 0.
+    ntokens = len(corpus.word_dict)
+    nseq = data_source['targets'].shape[0]
+    hidden = model.init_hidden(args.batch_size)
+    with torch.no_grad():
+        for i in range(0, nseq - 1, args.bptt):
+            data, targets = get_batch(data_source, i)
+            output, hidden = model(data, hidden)
+            hidden = repackage_hidden(hidden)
+            total_loss += len(data) * criterion(output, targets).item()
+    return total_loss / (nseq - 1)
 
 
-if __name__ == '__main__':
-    main()
+def train(data_source):
+    model.train()
+    total_loss = 0.
+    start_time = time.time()
+    ntokens = len(corpus.word_dict)
+    nseq = data_source['targets'].shape[0]
+    hidden = model.init_hidden(args.batch_size)
+    for batch, i in enumerate(range(0, nseq - 1, args.bptt)):
+        data, targets = get_batch(data_source, i)
+        model.zero_grad()
+        hidden = repackage_hidden(hidden)
+        output, hidden = model(data, hidden)
+        loss = criterion(output, targets)
+        loss.backward()
+
+        # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        for p in model.parameters():
+            p.data.add_(p.grad, alpha=-lr)
+
+        total_loss += loss.item()
+
+        if batch % args.log_interval == 0 and batch > 0:
+            cur_loss = total_loss / args.log_interval
+            elapsed = time.time() - start_time
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
+                    'loss {:5.2f} | ppl {:8.2f}'.format(
+                epoch, batch, nseq // args.bptt, lr,
+                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
+            total_loss = 0
+            start_time = time.time()
+
+
+# Loop over epochs.
+lr = args.lr
+best_val_loss = None
+prev_ppl = float('+inf')
+
+print('=' * 89)
+params = sum(p.numel() for p in model.parameters())//1000000
+print('| Begin training | parameters {}'.format(params))
+print('=' * 89)
+
+for epoch in range(1, args.epochs+1):
+    epoch_start_time = time.time()
+    train(train_data)
+    val_loss = evaluate(val_data)
+    print('-' * 89)
+    print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+            'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
+                                       val_loss, math.exp(val_loss)))
+    print('-' * 89)
+    # Save the model if the validation loss is the best we've seen so far.
+    if not best_val_loss or val_loss < best_val_loss:
+        with open(os.path.join(args.save, 'model.pth'), 'wb') as f:
+            torch.save(model, f)
+        best_val_loss = val_loss
+    cur_ppl = math.exp(val_loss)
+    if prev_ppl - cur_ppl < 1:
+        lr /= 2
+    prev_ppl = cur_ppl
+
+# Load the best saved model.
+with open(os.path.join(args.save, 'model.pth'), 'rb') as f:
+    model = torch.load(f)
+    # after load the rnn params are not a continuous chunk of memory
+    # this makes them a continuous chunk, and will speed up forward pass
+    # Currently, only rnn model supports flatten_parameters function.
+    model.lstm.flatten_parameters()
+
+# Run on test data.
+test_loss = evaluate(test_data)
+print('=' * 89)
+print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+    test_loss, math.exp(test_loss)))
+print('=' * 89)
 
